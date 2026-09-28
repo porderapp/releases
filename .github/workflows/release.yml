@@ -1,0 +1,420 @@
+# Release pipeline for the Porder app.
+#
+# The app's source, tests and version history live in a private GitLab project.
+# This repo holds only the newest build, so every download URL here is stable
+# forever — no per-version releases, no changelog (that stays in the source
+# repo, in CHANGELOG.md and the git tags).
+#
+#   Android  https://github.com/porderapp/releases/releases/latest/download/porder-android.apk
+#   Windows  https://github.com/porderapp/releases/releases/latest/download/porder-windows-x64.zip
+#   Linux    https://github.com/porderapp/releases/releases/latest/download/porder-linux-x64.tar.gz
+#   Notes    https://github.com/porderapp/releases/releases/latest/download/latest.json
+#
+# `latest.json` is the release note the app already shows, taken from the source
+# repo's assets/release_notes.json by scripts/release_note_latest.mjs: version,
+# build, publishedAt, the note text in the shape ReleaseNote.fromJson parses, and
+# the download URLs. It is what an in-app update check reads, and like every
+# other asset here it describes only the newest build.
+#
+# How to run it
+#   Actions -> Release latest -> Run workflow. Leave `ref` empty to build the
+#   newest v* tag in GitLab, or name a tag / branch / commit SHA to build that.
+#   `resolve` refuses a tag that disagrees with the version in pubspec.yaml.
+#
+# Secrets — Settings -> Secrets and variables -> Actions -> Secrets
+#   GITLAB_READ_TOKEN          a GitLab token: a
+#                              project access token with `read_repository`, or a
+#                              personal token with the `read_repository` scope
+#   ANDROID_KEYSTORE_BASE64    `base64 -w0 keys/porder-upload.jks`
+#   ANDROID_KEYSTORE_PASSWORD  the keystore password
+#   ANDROID_KEY_ALIAS          the key alias (`upload` in the example file)
+#   ANDROID_KEY_PASSWORD       the key password
+#
+# Variables — Settings -> Secrets and variables -> Actions -> Variables
+#   LEMONSQUEEZY_CHECKOUT_URL  where the paywall's Buy Pro button goes. A public
+#                              URL, so a variable and not a secret; empty leaves
+#                              the button inert, which the sheet already handles.
+#   BUG_REPORT_URL             where the app POSTs a bug report — the Worker in
+#                              worker/ (`https://porder-report.<account>.workers.dev/reportBug`).
+#                              Empty leaves the dialog saying reporting is unavailable.
+#
+# The publish job requires only the APK: a Linux or Windows failure still ships
+# the rest, and that platform's last good asset simply stays up.
+#
+# If publishing is refused with a permissions error, set
+# Settings -> Actions -> General -> Workflow permissions to "Read and write".
+name: Release latest
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "GitLab tag, branch or SHA to build (empty = newest v* tag)"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-latest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: porderapp/porder
+  SOURCE_URL: gitlab.com/porderapp/porder.git
+  FLUTTER_VERSION: "3.47.5"
+
+jobs:
+  # One place decides what is built, so the three platform jobs agree on the ref
+  # and the version the release is named after.
+  resolve:
+    name: Resolve the source ref
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      version: ${{ steps.pick.outputs.version }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Pick the ref
+        id: pick
+        env:
+          GITLAB_READ_TOKEN: ${{ secrets.GITLAB_READ_TOKEN }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITLAB_READ_TOKEN}" ]; then
+            echo "GITLAB_READ_TOKEN is not set — see the header of this workflow"
+            exit 1
+          fi
+          ref="${INPUT_REF}"
+          if [ -z "$ref" ]; then
+            ref=$(git ls-remote --tags --refs \
+              "https://oauth2:${GITLAB_READ_TOKEN}@${SOURCE_URL}" 'v*' \
+              | awk -F/ '{print $NF}' | sort -V | tail -n1)
+          fi
+          if [ -z "$ref" ]; then
+            echo "No v* tag in ${SOURCE_REPO} and no ref given — nothing to build"
+            exit 1
+          fi
+          echo "Building ${SOURCE_REPO}@${ref}"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.pick.outputs.ref }}
+          token: ${{ secrets.GITLAB_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Read the version, and check it agrees with the tag
+        id: version
+        env:
+          REF: ${{ steps.pick.outputs.ref }}
+        run: |
+          set -euo pipefail
+          raw=$(awk '/^version:/{print $2; exit}' pubspec.yaml)
+          version="${raw%%+*}"
+          build="${raw##*+}"
+          if [ "$build" = "$raw" ]; then
+            echo "pubspec.yaml carries no build number: 'version: $raw'"
+            exit 1
+          fi
+          case "$REF" in
+            v*)
+              if [ "$REF" != "v$version" ]; then
+                echo "tag $REF does not match pubspec.yaml ($raw)"
+                exit 1
+              fi
+              ;;
+          esac
+          node scripts/check_version.mjs
+          echo "Porder ${version}+${build}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
+      # The current release note in the two forms the release needs: latest.json
+      # for the in-app update check, and a markdown fragment for the release page.
+      # The script refuses to write anything when the note's version disagrees
+      # with pubspec.yaml, so it cannot describe the wrong build.
+      - name: Write the release note
+        run: node scripts/release_note_latest.mjs latest.json release-notes.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-note
+          path: |
+            latest.json
+            release-notes.md
+          if-no-files-found: error
+
+  android:
+    name: Android APK (standalone)
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.GITLAB_READ_TOKEN }}
+          persist-credentials: false
+
+      # pubspec.yaml declares .env as an asset and it is gitignored, so every
+      # build needs the file to exist. The checkout URL is public, which is why
+      # it can live in the artifact at all.
+      - name: Write the .env asset
+        env:
+          CHECKOUT_URL: ${{ vars.LEMONSQUEEZY_CHECKOUT_URL }}
+          REPORT_URL: ${{ vars.BUG_REPORT_URL }}
+        run: |
+          {
+            echo "LEMONSQUEEZY_CHECKOUT_URL=${CHECKOUT_URL}"
+            echo "BUG_REPORT_URL=${REPORT_URL}"
+          } > .env
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # Mirrors the documented local setup: keys/porder-upload.jks at the repo
+      # root, key.properties at android/, whose storeFile is resolved relative to
+      # android/app/. A release build without a keystore fails on purpose.
+      - name: Restore the signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "Secret $name is not set — see the header of this workflow"
+              exit 1
+            fi
+          done
+          mkdir -p keys
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d -i > keys/porder-upload.jks
+          {
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storeFile=../../keys/porder-upload.jks"
+          } > android/key.properties
+
+      # standalone: this is the APK we host, so it unlocks with a Lemon Squeezy
+      # key. Without the define an Android build resolves to the Play channel,
+      # which carries no license entry at all.
+      - name: Build the signed APK
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build apk --release --dart-define=PORDER_CHANNEL=standalone
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk dist/porder-android.apk
+          sha256sum dist/porder-android.apk
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: porder-android
+          path: dist/porder-android.apk
+          if-no-files-found: error
+
+  linux:
+    name: Linux tarball (x64)
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.GITLAB_READ_TOKEN }}
+          persist-credentials: false
+
+      # libsecret is a hard build dependency of flutter_secure_storage; the rest
+      # is the Linux desktop toolchain (scripts/build_linux.sh checks for them).
+      - name: Install the desktop toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Write the .env asset
+        env:
+          CHECKOUT_URL: ${{ vars.LEMONSQUEEZY_CHECKOUT_URL }}
+          REPORT_URL: ${{ vars.BUG_REPORT_URL }}
+        run: |
+          {
+            echo "LEMONSQUEEZY_CHECKOUT_URL=${CHECKOUT_URL}"
+            echo "BUG_REPORT_URL=${REPORT_URL}"
+          } > .env
+
+      # The script builds the bundle, copies the .desktop/.metainfo/.png files
+      # in, and tars it as dist/porder-linux-x64-<version>-<build>.tar.gz.
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          scripts/build_linux.sh
+          cp dist/porder-linux-x64-*.tar.gz dist/porder-linux-x64.tar.gz
+          sha256sum dist/porder-linux-x64.tar.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: porder-linux
+          path: dist/porder-linux-x64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows zip (x64)
+    needs: resolve
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.GITLAB_READ_TOKEN }}
+          persist-credentials: false
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Write the .env asset
+        shell: pwsh
+        env:
+          CHECKOUT_URL: ${{ vars.LEMONSQUEEZY_CHECKOUT_URL }}
+          REPORT_URL: ${{ vars.BUG_REPORT_URL }}
+        run: |
+          $content = "LEMONSQUEEZY_CHECKOUT_URL=$env:CHECKOUT_URL`nBUG_REPORT_URL=$env:REPORT_URL`n"
+          [IO.File]::WriteAllText((Join-Path $PWD ".env"), $content)
+
+      # Staged under dist/Porder/ so extracting the zip gives one folder rather
+      # than a pile of DLLs. The runner's Visual Studio carries the C++ desktop
+      # workload Flutter needs; the desktop channel is `direct` with no define.
+      - name: Build and package
+        shell: pwsh
+        run: |
+          flutter pub get
+          flutter config --enable-windows-desktop
+          flutter build windows --release
+          $release = "build\windows\x64\runner\Release"
+          if (-not (Test-Path $release)) { $release = "build\windows\runner\Release" }
+          if (-not (Test-Path $release)) { throw "Windows release output not found" }
+          New-Item -ItemType Directory -Force -Path "dist\Porder" | Out-Null
+          Copy-Item -Recurse -Force "$release\*" "dist\Porder"
+          Compress-Archive -Path "dist\Porder" -DestinationPath "dist\porder-windows-x64.zip" -Force
+          Get-FileHash "dist\porder-windows-x64.zip" -Algorithm SHA256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: porder-windows
+          path: dist/porder-windows-x64.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish the latest release
+    needs: [resolve, android, linux, windows]
+    if: always() && !cancelled() && needs.android.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BUILD: ${{ needs.resolve.outputs.build }}
+    steps:
+      # Artifacts that failed to build are simply absent; the asset with the
+      # same name from the previous release stays up.
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Only the assets, and only the ones that actually built: a platform that
+      # failed has nothing here, so its last good asset stays up. The markdown
+      # fragment is deliberately not staged — it belongs in the release body,
+      # not next to the downloads.
+      - name: Stage the assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for asset in porder-android.apk porder-windows-x64.zip \
+            porder-linux-x64.tar.gz latest.json; do
+            if [ -f "artifacts/${asset}" ]; then
+              cp "artifacts/${asset}" dist/
+            fi
+          done
+          ls -l dist
+
+      # The note itself comes from the source repo's assets/release_notes.json, so
+      # this page says the same thing the app and the site do.
+      - name: Assemble the release notes
+        run: |
+          set -euo pipefail
+          notes="${PWD}/notes.md"
+          cat artifacts/release-notes.md > "$notes"
+          {
+            echo "**Porder v${VERSION}** (build ${BUILD}) — the current build. These assets are"
+            echo "replaced on every release, so the links below always point at the newest version."
+            echo
+            echo "| Platform | File |"
+            echo "| --- | --- |"
+            echo "| Android 7.0+ | \`porder-android.apk\` |"
+            echo "| Windows 10/11 (x64) | \`porder-windows-x64.zip\` |"
+            echo "| Linux (x64) | \`porder-linux-x64.tar.gz\` |"
+            echo
+            echo "\`latest.json\` carries the same note for the in-app update check."
+            echo
+            echo "**SHA-256**"
+            echo
+            echo '```'
+          } >> "$notes"
+          (cd dist && sha256sum *) >> "$notes"
+          {
+            echo '```'
+            echo
+            echo "Website: https://porder.io.vn"
+          } >> "$notes"
+          cat "$notes"
+
+      - name: Create or update the release
+        run: |
+          set -euo pipefail
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --title "Porder v${VERSION}" --notes-file notes.md --latest
+          else
+            gh release create latest --title "Porder v${VERSION}" --notes-file notes.md \
+              --latest --target "$GITHUB_SHA"
+          fi
+
+      - name: Upload the assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No artifact was built — nothing to publish"
+            exit 1
+          fi
+          gh release upload latest "${files[@]}" --clobber
+          gh release view latest --json tagName,assets \
+            --jq '"\(.tagName): \([.assets[].name] | join(", "))"'
